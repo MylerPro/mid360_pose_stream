@@ -46,6 +46,13 @@ def _validate(context, *args, **kwargs):
             f"got {frame_rate}")
     if not 0.0 < send_rate <= 100.0:
         raise RuntimeError(f"send_rate must be in (0, 100] Hz, got {send_rate}")
+    xfer = int(LaunchConfiguration("xfer_format").perform(context))
+    ltype = int(LaunchConfiguration("lidar_type").perform(context))
+    if (xfer, ltype) not in ((1, 1), (0, 4)):
+        raise RuntimeError(
+            f"xfer_format={xfer} 与 lidar_type={ltype} 不配对，FAST-LIO 会收不到数据。"
+            f"正确组合：xfer_format=1 + lidar_type=1（推荐，真实时间戳）；"
+            f"或 xfer_format=0 + lidar_type=4（旧，仅 10 Hz 正确）")
     if source not in ("odom", "map"):
         raise RuntimeError(
             f"pose_source_frame must be 'odom' (odometry) or 'map' (needs AMCL), "
@@ -65,6 +72,8 @@ def generate_launch_description():
     rviz_config = os.path.join(share, "config", "pose_stream.rviz")
 
     frame_rate = LaunchConfiguration("frame_rate")
+    xfer_format = LaunchConfiguration("xfer_format")
+    lidar_type = LaunchConfiguration("lidar_type")
     send_rate = LaunchConfiguration("send_rate")
     pose_source_frame = LaunchConfiguration("pose_source_frame")
     max_tf_age = LaunchConfiguration("max_tf_age")
@@ -72,6 +81,9 @@ def generate_launch_description():
     serial_port = LaunchConfiguration("serial_port")
     baudrate = LaunchConfiguration("baudrate")
     log_frames = LaunchConfiguration("log_frames")
+    max_speed = LaunchConfiguration("max_speed")
+    divergence_frames = LaunchConfiguration("divergence_frames")
+    max_lidar_backlog = LaunchConfiguration("max_lidar_backlog")
     rviz = LaunchConfiguration("rviz")
 
     # 雷达驱动：MID360 本身是 20 万点/秒的连续流，publish_freq 只决定多久攒一帧。
@@ -82,7 +94,11 @@ def generate_launch_description():
         name="livox_mid360",
         output="screen",
         parameters=[{
-            "xfer_format": 0,
+            # ⚠️ 1 = CustomMsg —— 必须与 FAST-LIO 的 preprocess.lidar_type=1 配对。
+            # CustomMsg 带【驱动测得的真实逐点 offset_time】，FAST-LIO 的 avia_handler
+            # 直接使用它，不做任何 yaw 合成，因此与雷达帧率无关。
+            # 若改回 0（PointCloud2）就必须同时把 lidar_type 改回 4，否则收不到数据。
+            "xfer_format": ParameterValue(xfer_format, value_type=int),
             "multi_topic": 0,
             "data_src": 0,
             "publish_freq": ParameterValue(frame_rate, value_type=float),
@@ -95,16 +111,28 @@ def generate_launch_description():
         remappings=[("livox/imu", "/imu/data")],
     )
 
-    # FAST-LIO：位姿源。scan_rate 必须等于雷达实际帧率 —— mid360_handler 用
-    # omega_l = 0.361 * SCAN_RATE 从 yaw 合成每个点的时间；两者不一致时合成时间
-    # 会被拉伸/压缩（10 vs 60 会错 6 倍）-> 去畸变时间基准错 -> 位姿退化甚至发散。
+    # FAST-LIO：位姿源。
+    # ⚠️ scan_rate 只在 lidar_type=4（mid360_handler 的 yaw 合成）下有用，
+    #    而它在 publish_freq=60 下【到底该填多少无法确定】：实测同样填 60，
+    #    一次完全正常、一次从开机就 "No Effective Points" 并最终发散
+    #    （两次的代码/配置/编译参数/速率核对为相同 → 失败不是确定性的）。
+    #    所以不要依赖它 —— 用 lidar_type=1（CustomMsg 真实时间戳），
+    #    curvature 直接来自驱动的 offset_time，这个值就不参与位姿计算了。
     fastlio = Node(
         package="fast_lio",
         executable="fastlio_mapping",
         name="fastlio_mapping",
         output="screen",
         parameters=[fastlio_config, {
-            "preprocess.scan_rate": ParameterValue(frame_rate, value_type=int),
+            # 1 = avia/CustomMsg（用驱动的真实 offset_time），4 = mid360/PointCloud2
+            # （用 yaw 合成时间，60 Hz 下会算坏 —— 详见 YAML 里的说明）
+            "preprocess.lidar_type": ParameterValue(lidar_type, value_type=int),
+            # 固定 10，【不要】改成 frame_rate —— 它是雷达的一圈方位角周期，见上。
+            # 只有 lidar_type=4 会用到；lidar_type=1 时不参与位姿计算。
+            "preprocess.scan_rate": 10,
+            # 治那 1.4 秒启动积压：FAST-LIO 初始化期间驱动堆下的帧永不排空
+            # （sync_packages 严格 FIFO、从不丢弃）。超过此值就丢最旧的帧。
+            "max_lidar_backlog": ParameterValue(max_lidar_backlog, value_type=int),
         }],
     )
 
@@ -138,6 +166,9 @@ def generate_launch_description():
             "max_pose_age": ParameterValue(max_tf_age, value_type=float),
             "auto_origin": ParameterValue(auto_origin, value_type=bool),
             "log_frames": ParameterValue(log_frames, value_type=bool),
+            # 发散看门狗：位姿源发散时【停发】，避免底盘收到乱跑的位姿
+            "max_speed": ParameterValue(max_speed, value_type=float),
+            "divergence_frames": ParameterValue(divergence_frames, value_type=int),
             "stats_period": 5.0,
             "reconnect_period": 2.0,
         }],
@@ -154,9 +185,19 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument(
+            "lidar_type", default_value="1",
+            description="FAST-LIO 的 preprocess.lidar_type：1=avia/CustomMsg（默认，用驱动"
+                        "真实时间戳，与帧率无关）；4=mid360/PointCloud2（用 yaw 合成时间，"
+                        "仅在 10 Hz 下正确）。必须与 xfer_format 配对。"),
+        DeclareLaunchArgument(
+            "xfer_format", default_value="1",
+            description="Livox 驱动的消息格式：1=CustomMsg（默认，带真实逐点时间戳）；"
+                        "0=PointCloud2。必须与 lidar_type 配对（1↔1，0↔4）。"),
+        DeclareLaunchArgument(
             "frame_rate", default_value="60",
-            description="雷达帧率[Hz]，同时驱动 publish_freq 与 preprocess.scan_rate。"
-                        "两者必须一致，故绑成一个参数。回退写 10。"),
+            description="雷达发布帧率[Hz] → 驱动的 publish_freq。"
+                        "注意：它【不】驱动 preprocess.scan_rate（那是雷达的一圈"
+                        "方位角周期，固定 10，见 launch 内注释）。回退写 10。"),
         DeclareLaunchArgument(
             "send_rate", default_value="60.0",
             description="串口发送频率[Hz]。回退写 20.0。"),
@@ -172,6 +213,17 @@ def generate_launch_description():
         DeclareLaunchArgument("serial_port", default_value=SERIAL_BY_ID),
         DeclareLaunchArgument("baudrate", default_value="115200"),
         DeclareLaunchArgument("log_frames", default_value="true"),
+        DeclareLaunchArgument(
+            "max_speed", default_value="5.0",
+            description="发散看门狗的速度上限[m/s]。整车物理上跑不了这么快，"
+                        "连续超限就停发。设 0 关闭（不建议）。"),
+        DeclareLaunchArgument(
+            "divergence_frames", default_value="5",
+            description="连续多少帧超速后锁死停发。60Hz 下 5 帧仅 83 ms。"),
+        DeclareLaunchArgument(
+            "max_lidar_backlog", default_value="5",
+            description="FAST-LIO 最多保留几帧雷达数据（治那 1.4 秒启动积压）。"
+                        "延迟上限 ≈ 该值 / frame_rate。0 = 关闭。"),
         DeclareLaunchArgument(
             "rviz", default_value="false",
             description="是否启动 RViz。它是纯可视化，挂掉不影响发送，"

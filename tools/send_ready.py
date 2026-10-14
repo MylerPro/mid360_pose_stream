@@ -77,6 +77,61 @@ def tail_has(path, pat):
         return False
 
 
+def topic_hz(topic, seconds=6.0):
+    """用 `ros2 topic hz` 测频率（绕开本节点的 Python 订阅瓶颈）。
+
+    为什么要另起进程：本节点的 /livox/lidar 订阅在 60 Hz × 3360 点的
+    PointCloud2 下【读不过来】，实测一直读到 0.0 Hz 而权威值是 60.015 Hz ✗
+    —— 一个会误报 FAIL 的看板比没有更糟。
+
+    为什么走【外部 timeout + 文件重定向】而不是 subprocess.run(capture_output)：
+    在 rclpy 已经初始化的进程里抓管道输出实测拿不到东西（一直"测不到"），
+    而落到文件里稳定可靠（实测 60.015 Hz）。
+    """
+    tmp = "/tmp/.dsh_topic_hz.txt"
+    try:
+        import subprocess
+        subprocess.run(
+            f"timeout -k 1 {int(seconds)} ros2 topic hz {topic} > {tmp} 2>&1",
+            shell=True, timeout=seconds + 5, check=False)
+        with open(tmp, "r", errors="replace") as fh:
+            out = fh.read()
+        rates = re.findall(r"average rate: ([\d.]+)", out)
+        if rates:
+            return float(rates[-1])
+    except Exception:
+        pass
+    return None
+
+
+def ros_param(node, name, cast=float, default=None):
+    """读一个 ROS 参数（ros2 param get 会卡，所以统一带 timeout）。"""
+    try:
+        import subprocess
+        r = subprocess.run(["ros2", "param", "get", node, name],
+                           capture_output=True, text=True, timeout=6)
+        m = re.search(r"([-\d.]+)\s*$", r.stdout.strip())
+        if m:
+            return cast(m.group(1))
+    except Exception:
+        pass
+    return default
+
+
+def tail_text(path, limit=4000):
+    """读日志尾部若干字符（用于判断看门狗是否锁死）。"""
+    if not path or not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - limit))
+            return fh.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
 def recent_events(log, limit=7):
     """从 launch 日志里抽出关键业务事件，给看板当"事件流"用。"""
     pats = ("ORIGIN_LOCKED", "SET_ORIGIN_REJECTED", "GOAL_REJECTED", "GOAL_MAP",
@@ -158,8 +213,21 @@ class Probe(Node):
         self.tf = Buffer()
         TransformListener(self.tf, self)
         q = qos_profile_sensor_data
-        self.create_subscription(PointCloud2, "/livox/lidar", lambda m: self._h("lidar"), q)
-        self.create_subscription(Imu, "/imu/data", lambda m: self._h("imu"), q)
+        # 轨迹与逐级时间戳：2026-10-14 事故暴露的两个缺失检查
+        self.track = []            # [(t, x, y)] 来自 /odom 话题（可选，兜底）
+        self.tf_track = []         # [(t, x, y)] 来自 TF —— 与桥同源，优先用它
+        self.stamp_age = {}        # 话题 -> 最新一条消息的时间戳年龄
+
+        def _aged(key, count=None):
+            def cb(m):
+                if count:
+                    self._h(count)
+                st = m.header.stamp
+                self.stamp_age[key] = time.time() - (st.sec + st.nanosec * 1e-9)
+            return cb
+
+        self.create_subscription(PointCloud2, "/livox/lidar", _aged("/livox/lidar", "lidar"), q)
+        self.create_subscription(Imu, "/imu/data", _aged("/imu/data", "imu"), q)
         self.create_subscription(LaserScan, "/scan", lambda m: self._h("scan"), q)
         self.create_subscription(Odometry, "/odom", self._odom, 10)
         # 两种桥的"已发送"话题都数上（位姿流用 /chassis/serial_tx_pose）
@@ -174,8 +242,12 @@ class Probe(Node):
 
     def _odom(self, m):
         self.n["odom"] += 1
-        self.t["odom"] = time.time()
+        now = time.time()
+        self.t["odom"] = now
         self.odom = m.pose.pose.position
+        st = m.header.stamp
+        self.stamp_age["/odom"] = now - (st.sec + st.nanosec * 1e-9)
+        self.track.append((now, self.odom.x, self.odom.y))
 
 
 def main():
@@ -213,11 +285,28 @@ def main():
     node = Probe()
     W = 8.0
     t0 = time.time()
+    next_tf_sample = 0.0
     while time.time() - t0 < W:
         rclpy.spin_once(node, timeout_sec=0.05)
+        # 按 TF 采轨迹与时间戳年龄 —— 必须跟位姿流桥读【同一个源】(TF odom->base_link)。
+        # 不能用 /odom 话题：两者不同源时，话题缺失会让检查静默消失（实测踩过：
+        # 假 TF 只发 TF 不发 /odom，于是漂移检查一条都不打印）。
+        now_m = time.time()
+        if now_m >= next_tf_sample:
+            next_tf_sample = now_m + 0.1
+            try:
+                tr = node.tf.lookup_transform("odom", "base_link", rclpy.time.Time())
+                st = tr.header.stamp
+                node.stamp_age["TF odom->base_link"] = now_m - (st.sec + st.nanosec * 1e-9)
+                node.tf_track.append((now_m, tr.transform.translation.x,
+                                      tr.transform.translation.y))
+            except Exception:
+                pass
 
     emit("=" * 76)
     emit(f"发送就绪自检   {time.strftime('%Y-%m-%d %H:%M:%S')}   采样 {W:.0f}s")
+    emit("  ⓘ 本节点是单线程 Python，60 Hz 大点云下读不满 —— 下面几个频率是")
+    emit("    【下限】。权威值请用: ros2 topic hz <话题>")
     emit("=" * 76)
     bad = 0
 
@@ -357,10 +446,14 @@ def main():
     # /scan 只在启动 map_server+AMCL 时存在（nav2_localization:=true）。
     # 注意：本节点是单线程 Python，60 Hz 的大点云可能读不满 —— 绝对值会偏低，
     # 这里只判"有没有在流"，权威频率请用 `ros2 topic hz`。
-    checks = [("lidar", 60, "/livox/lidar"), ("imu", 50, "/imu/data"),
-              ("odom", 60, "/odom")]
+    checks = [("imu", 50, "/imu/data"), ("odom", 60, "/odom")]
     if node.count_publishers("/scan") > 0:
         checks.append(("scan", 10, "/scan"))
+    # /livox/lidar 本节点测不准（60 Hz × 3360 点读不过来），
+    # 试过另起进程测但在这个已初始化 rclpy 的进程里拿不到输出（试了 3 种写法）。
+    # 不再假装能测 —— 直接告诉操作员用权威命令，避免误报。
+    emit(f"  [info] /livox/lidar  : 请用  ros2 topic hz /livox/lidar  （期望 ~frame_rate）")
+
     for k, want, name in checks:
         hz = node.n[k] / W
         if hz < want * 0.25:
@@ -405,6 +498,68 @@ def main():
     else:
         emit(f"  {BAD} /odom 位置     : 无数据")
         bad += 1
+
+    # ---- 逐级时间戳（定位"延迟出在哪一级"）----
+    # 2026-10-14 事故里 /livox/lidar 只落后 17 ms 而 /odom 落后 1445 ms，
+    # 说明延迟是 FAST-LIO 加的、不是驱动。没有这一项就只能猜。
+    if pose_mode and node.stamp_age:
+        keys = [k for k in ("/livox/lidar", "/imu/data", "/odom",
+                            "TF odom->base_link") if k in node.stamp_age]
+        if keys:
+            worst = max(node.stamp_age[k] for k in keys)
+            tag = OK if worst < 0.15 else (WARN if worst < 0.5 else BAD)
+            emit(f"  {tag} 逐级时间戳   : "
+                 + "  ".join(f"{k}={node.stamp_age[k] * 1000:.0f}ms" for k in keys)
+                 + ("   ✓ 各级接近" if worst < 0.15
+                    else "   ← 哪一级突然变大就是哪一级的问题"))
+            if worst >= 0.5:
+                bad += 1
+
+    # ---- 静置漂移 / 等效速度（2026-10-14 事故的直接判据）----
+    # 上次里程计漂到 1000+ 米（等效 163 m/s），当时没有任何检查发现它。
+    # 判据用【物理可能的速度】：整车不可能超过 max_speed（与看门狗同源）。
+    track = node.tf_track if len(node.tf_track) >= 20 else node.track
+    src_txt = "TF" if track is node.tf_track else "/odom"
+    if pose_mode and len(track) >= 20:
+        t0s, x0s, y0s = track[0]
+        t1s, x1s, y1s = track[-1]
+        span = max(t1s - t0s, 1e-6)
+        dist = math.hypot(x1s - x0s, y1s - y0s)
+        eff = dist / span
+        # 逐采样点的【瞬时】速度 —— 平均值会把单次大跳变稀释掉（8 秒平均
+        # 会把一个 500 m/s 的单帧跳变摊成 0.13 m/s，正好绕过判据）。
+        peak_inst = 0.0
+        jump = 0.0
+        for i in range(1, len(track)):
+            j = math.hypot(track[i][1] - track[i - 1][1],
+                           track[i][2] - track[i - 1][2])
+            dt_i = max(track[i][0] - track[i - 1][0], 1e-6)
+            jump = max(jump, j)
+            peak_inst = max(peak_inst, j / dt_i)
+        limit = ros_param("/serial_pose_bridge", "max_speed", float, 3.0) or 3.0
+        info = (f"漂移({src_txt},{span:.0f}s): 位移 {dist:.3f} m  平均 {eff:.2f} m/s  "
+                f"瞬时峰值 {peak_inst:.2f} m/s  单次最大跳变 {jump:.3f} m")
+        if peak_inst > limit or eff > limit:
+            emit(f"  {BAD} {info}   ★ 超过物理上限 {limit:.1f} m/s —— 里程计在发散！"
+                 f"（看门狗应已停发，查 launch 日志里的 DIVERGENCE DETECTED）")
+            bad += 1
+        elif peak_inst > 1.0 or eff > 0.5:
+            emit(f"  {WARN} {info}   （在移动 / 有跳变；静止时应位移 <0.05 m）")
+        else:
+            emit(f"  {OK} {info}   ✓ 静止或正常速度范围内")
+
+    elif pose_mode:
+        emit(f"  {WARN} 漂移         : 样本不足"
+             f"（TF {len(node.tf_track)} 条 / /odom {len(node.track)} 条）"
+             " ← 位姿源没起来？")
+
+    # ---- 发散看门狗是否锁死 ----
+    if pose_mode:
+        txt = tail_text(log, 4000) if log else ""
+        if "DIVERGENCE DETECTED" in txt or "WATCHDOG=LATCHED" in txt:
+            emit(f"  {BAD} 发散看门狗   : ★ 已锁死停发 —— 位姿源发过散，"
+                 f"底盘收不到字节；处理完调 refresh_origin 解除")
+            bad += 1
 
     # ---- 位姿源滞后（位姿流模式下这是最关键的指标：闭环反馈延迟）----
     if pose_mode:

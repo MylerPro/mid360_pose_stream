@@ -174,3 +174,97 @@ NUC 侧**一切正常**（每个进程都 report 写成功）。
 | `set -u` 会让 ROS 的 `setup.bash` 直接退出 | 脚本里别用 `set -u`（或用 `${VAR:-}`） |
 | 静态 TF 必须挂在 URDF **根**节点 | 挂在 `base_footprint` 会让它有**两个父节点**，所有 `tf2` 查询**静默失败** |
 | MID360 雷达本身固定 10 Hz 扫描？ | **不是**。它是 20 万点/秒的连续流，`publish_freq` 只决定聚合窗口 |
+
+---
+
+## 10. ★★★ 最重要的一条：60 Hz 下"猜时间"会毁掉整个里程计
+
+**这是 2026-10-14 那次事故的根因，也是本项目最值钱的一条经验。**
+
+### 症状
+
+- `No Effective Points!` 刷屏（实测 1016 次，**开机几秒就开始**）
+- 位姿滞后 **1445 ms**（而输入点云只滞后 17 ms）
+- 前 20 秒看着还正常，之后**发散到 7000+ 米**
+
+### 机理（三步，缺一不可）
+
+**第一步：`mid360_handler` 用 yaw 猜每个点的时间，而 60 Hz 下这个猜法会数错圈数。**
+
+```cpp
+double omega_l = 0.361 * scan_rate;                     // scan_rate=60 → 21.66 deg/ms
+if (yaw_angle <= yaw_fp[layer]) curvature = (yaw_fp - yaw_angle) / omega_l;
+else                            curvature = (yaw_fp - yaw_angle + 360.0) / omega_l;
+if (curvature < time_last[layer]) curvature += 360.0 / omega_l;   // 每"绕回一圈"加 16.6 ms
+```
+
+这个模型的前提是 **"一帧 = 一整圈 360° 方位角"**。10 Hz（100 ms/帧）成立；
+60 Hz 一帧只有 16.7 ms、方位角只走约 60°，**凑不满一圈** →
+MID360 是非重复扫描、一帧内 yaw 会乱跳 → **每次乱跳都被当成"绕回一圈"，多加 16.6 ms** ✗
+实测累积约 **86 次 × 16.6 ms = 1.43 秒** ✓ 与实测滞后 1445 ms 吻合。
+
+**第二步：这个荒谬值被 `lidar_mean_scantime` 【永久】学进去。**
+
+```cpp
+else if (curvature_back/1000 < 0.5 * lidar_mean_scantime)
+    lidar_end_time = beg + lidar_mean_scantime;        // 用均值，【不更新】
+else {
+    scan_num++;
+    lidar_end_time = beg + curvature_back/1000;
+    lidar_mean_scantime += (curvature_back/1000 - lidar_mean_scantime)/scan_num;  // 只有这里更新
+}
+```
+
+初值 **0.0** → 第一帧必然走 `else` → **均值 = 第一帧的值**。
+若第一帧是 1.4 秒，之后每帧的正常值 16.6 ms 永远满足
+`16.6 < 0.5 × 1400 = 700` → **永远走上面的分支 → 均值永远停在 1.4 秒，再也不会被修正** ✗✗
+
+**第三步：1.4 秒的 `lidar_end_time` 引发三个连锁后果。**
+
+| 后果 | 代码 | 实测 |
+|---|---|---|
+| 每帧都要等 IMU 追 1.4 秒 | `if (last_timestamp_imu < lidar_end_time) return false;` | 滞后 **1445 ms** ✓ |
+| 用 1.4 秒的运动量去校正 16.7 ms 的扫描（点云被抹花）| `p_imu->Process(...)` 的 IMU 窗口 = `[beg, beg+1.4s]` | 点云糊掉 |
+| 匹配全失败 → EKF 只能靠 IMU 递推 → 漂移 → 失控 | `if (effct_feat_num < 1) "No Effective Points!"` | **1016 次**；末期 **(4103, 6713) m** ✓ |
+
+### 为什么同样的配置**有时**能跑
+
+**因为"第一帧会被算成多少"是不可控的** —— 取决于扫描图案相位、机器人朝向、视场内容。
+
+| | 第一帧算出 | 均值 | 结果 |
+|---|---|---|---|
+| 14:53 那次 | 正常的 ~16.6 ms | 16.6 ms ✓ | 正常跑完（滞后 10 ms，告警 **0** 次，`\|xy\|` ≤ 3.58 m）|
+| 18:20 那次 | 荒谬的 ~1.43 s | **1.43 s** ✗ | **永久中毒 → 发散** |
+
+**两次的代码 / 配置 / 编译参数 / 速率全部核对为相同** ⟹ **失败不是确定性的**。
+⚠️ **一个"有时能跑、有时开机就废"的配置对闭环控制是不可用的。**
+
+### 解法：不要猜，直接问雷达
+
+```cpp
+// avia_handler（lidar_type=1）：curvature 直接来自驱动测得的真实 offset_time
+pl_full[i].curvature = msg->points[i].offset_time / float(1000000);
+```
+
+- 不再有 yaw 合成 → 没有"绕回几次"的随机性 ✓
+- 不再用 `lidar_mean_scantime` → 没有"第一帧毒化均值"的路径 ✓
+- 每帧的帧时长就是真实的 ~16.6 ms → **必然正常，与相位无关** ✓
+
+需要驱动配合 `xfer_format: 1`（CustomMsg）。主 launch 已把两者绑在一起校验，
+配错会直接拒绝启动（`xfer_format=1 配 lidar_type=4` 之类的组合会被拦下）。
+
+### 实测对比（同机同频）
+
+| 判据 | `lidar_type=4` 失败那次 | `lidar_type=1` 修复后 |
+|---|---|---|
+| `No Effective Points` | **1016 次**（开机几秒起） ✗ | **0 次** ✓ |
+| 静置漂移 | 2720 m / 16.6 s ✗ | **0.0027 m / 35 s** ✓ |
+| TF 滞后 | 1445 ms ✗ | **9~13 ms** ✓ |
+| 逐级时间戳 | 17 ms vs 1445 ms ✗ | **各级 ≤13 ms** ✓ |
+
+### 可证伪的检验
+
+- 旧配置（`lidar_type=4`）连起 5 次 → 预测 `No Effective Points` **有时 0、有时上千**
+- 新配置（`lidar_type=1`）连起 5 次 → 预测**每次都是 0**
+
+**如果新配置也偶尔出现 `No Effective Points`，说明这个解释不完整，需要重新分析。**

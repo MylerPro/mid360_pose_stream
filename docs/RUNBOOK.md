@@ -186,7 +186,30 @@ bash $REPO/tools/refresh_origin.sh
 
 ---
 
-## 7. 环境备忘
+## 7. ✅ 2026-10-14 实机验证结果（六项判据全过）
+
+```
+[ OK ] 位姿流发送频率 :  60.1 Hz（配置 send_rate=60）
+[ OK ] 逐级时间戳     : /imu/data=1ms  /odom=9ms  TF odom->base_link=13ms   ✓ 各级接近
+[ OK ] 漂移(TF,8s)   : 位移 0.010 m  平均 0.00 m/s  瞬时峰 0.09 m/s   ✓
+[ OK ] 位姿源滞后     : odom->base_link     9 ms  ← 闭环可用
+[ OK ] /imu/data 200.1 Hz   /odom 60.0 Hz
+[ OK ] No Effective Points = 0 次（静置 35 秒漂移 0.0027 m）
+```
+
+| # | 判据 | 通过标准 | 修复前（失败那次）|
+|---|---|---|---|
+| 1 | 静置漂移 | 60 s < 0.05 m | 2720 m / 16.6 s ✗ |
+| 2 | 逐级时间戳 | 各级差 < 30 ms | 17 ms vs 1445 ms ✗ |
+| 3 | TF 滞后 | < 100 ms | 1445 ms ✗ |
+| 4 | 频率 | = frame_rate / 200 / = send_rate | 正常 |
+| 5 | **`No Effective Points`** | **必须 0 次** | **1016 次** ✗ |
+| 6 | 发散看门狗 | 未锁死 | 无此防线 |
+
+**第 5 项是根因指标**：旧配置（`lidar_type=4` 用 yaw 猜时间）会在开机几秒就开始刷它，
+然后必然发散 —— 详见 `TROUBLESHOOTING.md` 第 10 节。
+
+## 8. 环境备忘
 
 - 雷达网口 IP **持久化**（NetworkManager 静态配置）：`192.168.1.50/24`
 - 零点**只存在桥的内存里**，launch 重启即丢（`auto_origin` 会重锁一次）

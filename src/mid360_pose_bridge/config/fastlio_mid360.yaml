@@ -1,15 +1,32 @@
 /**:
   ros__parameters:
     feature_extract_enable: false
-    point_filter_num: 3
-    # 2026-10-13 调参：为降低位姿滞后（原 1413 ms，闭环反馈延迟过大）。
-    # 实测瓶颈在【体素滤波后的点数】(feats_down_size ~1766) × max_iteration 次
-    # ikd-Tree 5 近邻搜索，而不在原始点数（给 mid360_handler 加 point_filter_num
-    # 抽稀 15280->5093 后滞后毫无变化，已证伪）。
-    # 备份/回退见 backup_fastlio_20261013_lag_tuning/ 与
-    # patches/fastlio_lag_tuning.patch
-    max_iteration: 2
-    filter_size_surf: 1.0
+    # ⚠️ 60 Hz 下必须为 1。每帧只有约 3360 点（总点率 20 万/秒不变），
+    # 再抽稀会让进 EKF 的点掉到 100 多个 → 约束严重不足 → 里程计发散
+    # （实测：18 秒漂到 1000+ 米）。10 Hz 时每帧 15280 点，抽稀才安全。
+    point_filter_num: 1
+
+    # ── 积压保护（本项目对 FAST-LIO 的补丁）────────────────────────────────
+    # FAST-LIO 初始化约 1.4 秒，这期间驱动一直往 lidar_buffer 里堆帧；而
+    # sync_packages 只取最旧的帧、严格 FIFO、从不丢弃，吞吐又刚好等于输入速率
+    # → 这段【启动积压永远排不掉】，位姿时间戳恒定滞后约 1.4 秒。
+    # 实测：10 Hz 时滞后 1.3 s（13 帧 × 100 ms），60 Hz 时 1.43 s（86 帧 × 16.7 ms）
+    #       —— 两种帧率都是 1.4 s，因为它是启动瞬态在墙上时间里的固定长度。
+    # 所以【调帧率治不了它】，抽稀点数也治不了（吞吐从来不是瓶颈）。
+    # 取值 = 最多保留几帧：延迟上限 ≈ 该值 / 雷达帧率。
+    #   5  @60 Hz → 约 83 ms；@10 Hz → 约 500 ms
+    #   0  = 关闭，恢复上游原行为（滞后 ~1.4 s）
+    max_lidar_backlog: 5
+
+    # ⚠️ 以下三个值是 2026-10-13 为"降低位姿滞后"做的调参，方向是【用精度换速度】。
+    # 当时把滞后归因于 feats_down_size × max_iteration 的 ikd-Tree 近邻搜索次数，
+    # 但真正原因是 mid360_handler 的 yaw 合成时间戳（见 preprocess.lidar_type 的说明）。
+    # 时间戳修好后这些牺牲就没必要了，而且它们正是 60 Hz 下发散的第二个原因：
+    #   filter_size_surf 1.0（默认 0.5）体素粗 2 倍 + point_filter_num 3
+    #   → 3360 点最后只剩约 170 个进 EKF ✗
+    # 这里恢复到接近上游默认值：
+    max_iteration: 3
+    filter_size_surf: 0.5
     filter_size_map: 0.5
     cube_side_length: 1000.0
     runtime_pos_log_enable: false
@@ -22,18 +39,42 @@
       time_offset_lidar_to_imu: 0.0
 
     preprocess:
-      # MID360 PointCloud2 path.  The Livox driver is configured with
-      # xfer_format=0, which includes x/y/z/intensity and per-point time.
-      lidar_type: 4
+      # ⚠️ 必须是 1（avia / CustomMsg 路径），不能用 4（mid360 / PointCloud2 路径）。
+      #
+      # 原因：lidar_type=4 走 mid360_handler，它【不用驱动给的真实时间戳】，
+      # 而是用 yaw 合成每个点的相对时间：
+      #     omega_l = 0.361 * scan_rate
+      #     curvature = (yaw_fp - yaw_angle + 360k) / omega_l
+      #     if (curvature < time_last[layer]) curvature += 360.0/omega_l;
+      # 这个模型假设"一帧 = 一整圈 360° 扫描" —— 只在 10 Hz（100 ms/帧）成立。
+      # 60 Hz 时一帧只有 16.7 ms、远不到一圈，那个"回绕补偿"会被乱序点
+      # 反复触发，合成出荒谬的逐点时间（实测整帧时间被推远 1.43 秒）。后果：
+      #   ① 去畸变时间基准错 → 运动补偿失效 → 里程计发散（实测 163 m/s 等效漂移）
+      #   ② 输出时间戳偏移 → 闭环反馈延迟约 1.4 秒
+      #
+      # lidar_type=1 走 avia_handler，直接使用驱动给的 msg->points[i].offset_time
+      # （真实逐点时间，见 preprocess.cpp: pl_full[i].curvature = offset_time/1e6），
+      # 与帧率无关，从根上解决。需驱动端配合 xfer_format=1（见 launch）。
+      lidar_type: 1
       scan_line: 4
       blind: 0.5
       timestamp_unit: 3
-      # scan_rate 必须等于雷达的实际帧率：mid360_handler 用
-      # omega_l = 0.361 * SCAN_RATE 从 yaw 合成每个点的时间。
-      # 若与驱动 publish_freq 不一致，合成时间会被拉伸/压缩
-      # （10 vs 60 会错 6 倍）→ 去畸变时间基准错 → 位姿退化甚至发散。
-      # 主 launch 会用 frame_rate 参数覆盖这里；单独起 FAST-LIO 调试时靠这个值。
-      scan_rate: 60
+      # 只有 lidar_type=4（mid360_handler）会用到它：omega_l = 0.361*scan_rate，
+      # 每次 yaw 绕回 360° 就给合成时间加 360/omega_l 毫秒。
+      #
+      # ⚠️ 这个值在 lidar_type=4 + publish_freq=60 下【到底该填多少，我无法确定】。
+      #    实测证据（2026-10-14）：
+      #      · 同样填 60、同样 publish_freq=60，14:53 那次运行完全正常
+      #        （|xy| 全程 ≤3.58 m，"No Effective Points" 0 次）
+      #      · 18:20 那次运行从开机几秒就刷 "No Effective Points"（1016 次），
+      #        最后漂到 7000+ 米
+      #    两次的代码/配置/编译参数/速率全部核对为相同，所以失败不是确定性的 ——
+      #    更像取决于扫描图案相位与驱动切帧边界的相对关系这类不可控因素。
+      #    结论：**不要依赖 lidar_type=4 在 60 Hz 下的行为**，它有时能跑、有时不能。
+      #
+      # 现在 lidar_type=1（CustomMsg），curvature 来自驱动的真实 offset_time，
+      # 这个值【完全不参与位姿计算】，填什么都一样。保留仅供回退对比。
+      scan_rate: 10
 
     mapping:
       acc_cov: 0.1

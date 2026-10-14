@@ -30,6 +30,7 @@ No navigation goal and no ``/cmd_vel`` is ever serialised by this node.
 """
 import math
 import struct
+import time
 
 import rclpy
 import serial
@@ -71,6 +72,18 @@ class SerialPoseBridge(Node):
             "baudrate": 115200,
             # 默认与 launch 的 send_rate 一致；launch 会用参数覆盖这里。
             "send_rate": 60.0,
+            # ── 发散看门狗 ──────────────────────────────────────────────
+            # 2026-10-14 事故：FAST-LIO 发散到 1000+ 米（等效 163 m/s），
+            # 桥毫不知情地按 60 Hz 把这个位姿发了 1 分多钟给底盘 ✗
+            # 现在按【物理可能的速度】判据拦截：整车不可能跑得比 max_speed 快。
+            # 连续 divergence_frames 帧超限就【锁死停发】，并每轮统计打印 ERROR。
+            # 清除方式：调用 refresh_origin 服务（表示操作员已检查并重新归零）。
+            # 设 max_speed 为 0 或负数可关闭这个保护（不建议）。
+            # 2026-10-14 实测：FAST-LIO 的正常匹配修正会出现单帧约 7.5 cm 的
+            # 跳变（等效 4.49 m/s），设 3.0 会让 5 次连续跳变误锁死停发。
+            # 放宽到 5.0 —— 仍远低于发散时的量级（上次实测 163 m/s，537 m/s）。
+            "max_speed": 5.0,          # m/s，整车物理上限
+            "divergence_frames": 5,    # 连续超限多少帧后锁死（60Hz 下仅 83 ms）
             # 默认取里程计链 odom -> base_link（FAST-LIO，融合 MID360 的 IMU 与点云），
             # 不依赖地图/AMCL/初始位姿。要改用全局定位就把 map_frame 设成 "map"。
             "map_frame": "odom",
@@ -100,6 +113,10 @@ class SerialPoseBridge(Node):
         self.base_frame = str(self.get_parameter("base_frame").value)
         self.max_pose_age = max(float(self.get_parameter("max_pose_age").value), 0.0)
         self.auto_origin = bool(self.get_parameter("auto_origin").value)
+        # 发散看门狗（见 defaults 里的说明）
+        self.max_speed = float(self.get_parameter("max_speed").value)
+        self.divergence_frames = max(
+            int(self.get_parameter("divergence_frames").value), 1)
         self.origin_topic = str(self.get_parameter("origin_topic").value)
         self.log_frames = bool(self.get_parameter("log_frames").value)
         self.reconnect_period = max(
@@ -129,6 +146,12 @@ class SerialPoseBridge(Node):
         self.tx_bytes = 0
         self.tx_errors = 0
         self.last_values = None
+        # 发散看门狗状态
+        self._wd_prev = None           # (t, x, y) 上一帧用于算速度
+        self._wd_strikes = 0           # 连续超限计数
+        self._wd_latched = False       # 锁死标记
+        self._wd_worst_speed = 0.0     # 观察到的最快等效速度
+        self._wd_at = None             # 锁死时刻
         self.wait_reason = "waiting for localization TF"
         self.last_reconnect_attempt_ns = 0
         self._open_port(initial=True)
@@ -298,6 +321,14 @@ class SerialPoseBridge(Node):
         return True
 
     def handle_refresh_origin(self, request, response):
+        # 刷新零点同时解除发散锁死（表示操作员已检查过并重新归零）
+        if self._wd_latched:
+            self.get_logger().warn(
+                "refresh_origin 解除发散锁死，恢复发送（看门狗计数已清零）")
+            self._wd_latched = False
+            self._wd_strikes = 0
+            self._wd_worst_speed = 0.0
+            self._wd_prev = None
         """Re-lock the zero point and immediately tell the STM32 to re-zero.
 
         The ``(0, 0, 0)`` frame is the "inject the origin pose" convention: it
@@ -347,6 +378,39 @@ class SerialPoseBridge(Node):
                 self.wait_reason = str(error)
                 return
 
+        # ── 发散看门狗：在发送前拦截 ──
+        # 用【绝对位姿】的速度判断，与零点无关；整车不可能超过 max_speed。
+        if self._wd_latched:
+            self.wait_reason = (f"DIVERGENCE LATCHED at {self._wd_at} "
+                                f"(peak {self._wd_worst_speed:.1f} m/s) — "
+                                f"call refresh_origin to clear")
+            return
+        if self.max_speed > 0.0:
+            now_m = time.monotonic()
+            if self._wd_prev is not None:
+                t_prev, x_prev, y_prev = self._wd_prev
+                dt = now_m - t_prev
+                if dt > 1e-6:
+                    speed = math.hypot(values[0] - x_prev, values[1] - y_prev) / dt
+                    self._wd_worst_speed = max(self._wd_worst_speed, speed)
+                    if speed > self.max_speed:
+                        self._wd_strikes += 1
+                    else:
+                        self._wd_strikes = 0
+                    if self._wd_strikes >= self.divergence_frames:
+                        self._wd_latched = True
+                        self._wd_at = time.strftime("%H:%M:%S")
+                        self.get_logger().error(
+                            f"DIVERGENCE DETECTED — 位姿源在发散，已【停止发送】！"
+                            f" 等效速度 {speed:.1f} m/s > 上限 {self.max_speed:.1f} m/s，"
+                            f"连续 {self._wd_strikes} 帧超限；峰值 {self._wd_worst_speed:.1f} m/s。"
+                            f" 底盘不会收到任何字节（避免乱跑）。"
+                            f" 查因：① lidar_type 是否 1（CustomMsg 真实时间戳）"
+                            f" ② 静置时 /odom 是否漂移  ③ frame_rate 是否过高。"
+                            f" 处理完后调用 refresh_origin 服务解除。")
+                        return
+            self._wd_prev = (now_m, values[0], values[1])
+
         try:
             relative = self.relative_pose(values)
         except ValueError as error:
@@ -368,6 +432,12 @@ class SerialPoseBridge(Node):
         if self.last_values is not None:
             x_m, y_m, yaw_rad = self.last_values
             detail += f" last_tx=({x_m:.4f},{y_m:.4f},{yaw_rad:.4f})"
+        if self._wd_latched:
+            detail += " WATCHDOG=LATCHED(stopped)"
+        elif self._wd_strikes:
+            detail += f" WATCHDOG=strikes{self._wd_strikes}"
+        elif self.max_speed > 0.0:
+            detail += f" peak_speed={self._wd_worst_speed:.2f}m/s"
         self.get_logger().info(
             f"serial pose TX: port={state} frames={self.tx_frames} "
             f"bytes={self.tx_bytes} errors={self.tx_errors}"
