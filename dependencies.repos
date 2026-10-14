@@ -1,0 +1,18 @@
+# 第三方依赖 —— 用 vcstool 拉取，commit 已钉死（对应本项目验证过的版本）
+#
+#   mkdir -p src && vcs import src < dependencies.repos
+#   bash patches/apply.sh
+#
+# ⚠️ 不要把这两个包 vendor 进本仓库：
+#    FAST_LIO_ROS2 是 GPL-2.0，vendored 会把整个项目拖成 GPL；
+#    livox_ros_driver2 体积大且有自己的许可证。
+#    用「钉死 commit + 补丁」既保证可复现，又划清许可边界。
+repositories:
+  FAST_LIO_ROS2:
+    type: git
+    url: https://github.com/Ericsii/FAST_LIO_ROS2.git
+    version: 2fffc570a25d0df172720bac034fbdb6a13d2162   # branch ros2
+  livox_ros_driver2:
+    type: git
+    url: https://github.com/Livox-SDK/livox_ros_driver2.git
+    version: 4a1def929e5b59c7a8122d19fce6efba581ce9f7   # branch master

@@ -1,0 +1,25 @@
+# ROS 2 / colcon 构建产物
+build/
+install/
+log/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 本项目运行时产物（monitor CSV、取证包、离线测试日志）
+*.csv
+diag_*/
+offline_launch_test.log
+
+# 第三方依赖：由 dependencies.repos 拉取 + patches/apply.sh 打补丁，不进仓库
+src/FAST_LIO_ROS2/
+src/livox_ros_driver2/

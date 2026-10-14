@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>mid360_pose_bridge</name>
+  <version>1.0.0</version>
+  <description>
+    Stream the robot pose to an STM32 over USB CDC at a fixed rate.
+
+    MID360 (Livox) + FAST-LIO odometry -> pose on `odom -> base_link`
+    -> 15-byte frame `AA 55 | x f32 | y f32 | yaw f32 | sum8` -> STM32.
+
+    No map, no AMCL, no Nav2: the pose source is pure odometry, so it works as
+    soon as the lidar runs. The transmitted values are relative to a movable
+    origin that can be re-locked at runtime (the `refresh_origin` service also
+    emits one (0,0,0) frame so the MCU re-zeros at the same instant).
+  </description>
+  <maintainer email="TODO@example.com">TODO</maintainer>
+  <license>MIT</license>
+
+  <!-- 自研部分只需要这些 -->
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+
+  <!-- 外部依赖（用 dependencies.repos 拉进来） -->
+  <exec_depend>livox_ros_driver2</exec_depend>
+  <exec_depend>fast_lio</exec_depend>
+
+  <!-- 可选可视化 -->
+  <exec_depend>rviz2</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

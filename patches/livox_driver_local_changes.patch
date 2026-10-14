@@ -1,0 +1,93 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 7344d08..9d4cb03 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -281,6 +281,25 @@ else(ROS_EDITION STREQUAL "ROS2")
+ 
+   target_include_directories(${PROJECT_NAME} PRIVATE ${livox_sdk_INCLUDE_DIRS})
+ 
++  # Keep the SDK discoverable after installation for every driver launch file.
++  get_filename_component(LIVOX_LIDAR_SDK_LIBRARY_DIR "${LIVOX_LIDAR_SDK_LIBRARY}" DIRECTORY)
++  set_property(TARGET ${PROJECT_NAME} APPEND PROPERTY
++    INSTALL_RPATH "${LIVOX_LIDAR_SDK_LIBRARY_DIR}")
++
++  # ── 本地修复 ──────────────────────────────────────────────────────────
++  # 上游只【使用】 DISTRO_ROS 却从不定义它，靠外部 -DDISTRO_ROS=humble 传入。
++  # 全新工作空间没传的话会走 else 分支，而该分支里的
++  # get_target_property(...) 可能把 LIVOX_INTERFACES_INCLUDE_DIRECTORIES
++  # 设成 ...-NOTFOUND，CMake Generate 直接失败：
++  #   CMake Error: ... LIVOX_INTERFACES_INCLUDE_DIRECTORIES ... NOTFOUND
++  # （旧工作空间能编过只是因为它 CMakeCache 里残留着 DISTRO_ROS=humble）
++  # 这里从环境变量兜底，让全新 clone 也能编。
++  if(NOT DEFINED DISTRO_ROS AND DEFINED ENV{ROS_DISTRO})
++    set(DISTRO_ROS "$ENV{ROS_DISTRO}")
++    message(STATUS "DISTRO_ROS not given, defaulting to \$ROS_DISTRO=${DISTRO_ROS}")
++  endif()
++  # ─────────────────────────────────────────────────────────────────────
++
+   # get include directories of custom msg headers
+   if(DISTRO_ROS STREQUAL "humble" OR DISTRO_ROS STREQUAL "jazzy")
+     rosidl_get_typesupport_target(cpp_typesupport_target
+@@ -333,4 +352,4 @@ else(ROS_EDITION STREQUAL "ROS2")
+     launch_ROS2
+   )
+ 
+-endif()
+\ No newline at end of file
++endif()
+diff --git a/config/MID360_config.json b/config/MID360_config.json
+index e3df5d1..062aa47 100644
+--- a/config/MID360_config.json
++++ b/config/MID360_config.json
+@@ -11,13 +11,13 @@
+       "log_data_port": 56500
+     },
+     "host_net_info" : {
+-      "cmd_data_ip" : "192.168.1.5",
++      "cmd_data_ip" : "192.168.1.50",
+       "cmd_data_port": 56101,
+-      "push_msg_ip": "192.168.1.5",
++      "push_msg_ip": "192.168.1.50",
+       "push_msg_port": 56201,
+-      "point_data_ip": "192.168.1.5",
++      "point_data_ip": "192.168.1.50",
+       "point_data_port": 56301,
+-      "imu_data_ip" : "192.168.1.5",
++      "imu_data_ip" : "192.168.1.50",
+       "imu_data_port": 56401,
+       "log_data_ip" : "",
+       "log_data_port": 56501
+@@ -25,7 +25,7 @@
+   },
+   "lidar_configs" : [
+     {
+-      "ip" : "192.168.1.12",
++      "ip" : "192.168.1.102",
+       "pcl_data_type" : 1,
+       "pattern_mode" : 0,
+       "extrinsic_parameter" : {
+@@ -39,4 +39,3 @@
+     }
+   ]
+ }
+-
+diff --git a/launch_ROS2/rviz_MID360_launch.py b/launch_ROS2/rviz_MID360_launch.py
+index 31d3480..c34935c 100644
+--- a/launch_ROS2/rviz_MID360_launch.py
++++ b/launch_ROS2/rviz_MID360_launch.py
+@@ -18,6 +18,7 @@ cur_path = os.path.split(os.path.realpath(__file__))[0] + '/'
+ cur_config_path = cur_path + '../config'
+ rviz_config_path = os.path.join(cur_config_path, 'display_point_cloud_ROS2.rviz')
+ user_config_path = os.path.join(cur_config_path, 'MID360_config.json')
++sdk_library_path = '/usr/local/lib:' + os.environ.get('LD_LIBRARY_PATH', '')
+ ################### user configure parameters for ros2 end #####################
+ 
+ livox_ros2_params = [
+@@ -50,6 +51,7 @@ def generate_launch_description():
+         )
+ 
+     return LaunchDescription([
++        launch.actions.SetEnvironmentVariable(name='LD_LIBRARY_PATH', value=sdk_library_path),
+         livox_driver,
+         livox_rviz,
+         # launch.actions.RegisterEventHandler(

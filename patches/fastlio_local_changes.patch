@@ -1,0 +1,192 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e091f3a..a966a63 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -57,7 +57,7 @@ find_package(sensor_msgs REQUIRED)
+ find_package(std_msgs REQUIRED)
+ find_package(std_srvs REQUIRED)
+ find_package(visualization_msgs REQUIRED)
+-find_package(pcl_ros REQUIRED)
++find_package(tf2_ros REQUIRED)
+ find_package(pcl_conversions REQUIRED)
+ find_package(livox_ros_driver2 REQUIRED)
+ find_package(rosidl_default_generators REQUIRED)
+@@ -71,14 +71,14 @@ set(dependencies
+   std_msgs
+   std_srvs
+   visualization_msgs
+-  pcl_ros
++  tf2_ros
+   pcl_conversions
+   livox_ros_driver2
+ )
+ 
+ # Thirdparty libraries
+ find_package(Eigen3 REQUIRED)
+-find_package(PCL REQUIRED COMPONENTS common io)
++find_package(PCL REQUIRED COMPONENTS common io filters kdtree)
+ 
+ message(Eigen: ${EIGEN3_INCLUDE_DIR})
+ message(STATUS "PCL: ${PCL_INCLUDE_DIRS}")
+diff --git a/package.xml b/package.xml
+index 8c39e18..bf941d7 100644
+--- a/package.xml
++++ b/package.xml
+@@ -25,7 +25,8 @@
+   <depend>sensor_msgs</depend>
+   <depend>common_interfaces</depend>
+   <depend>tf2</depend>
+-  <depend>pcl_ros</depend>
++  <depend>tf2_ros</depend>
++  <depend>libpcl-all-dev</depend>
+   <depend>pcl_conversions</depend>
+   <depend>livox_ros_driver2</depend>
+ 
+diff --git a/src/laserMapping.cpp b/src/laserMapping.cpp
+index d441261..990de94 100644
+--- a/src/laserMapping.cpp
++++ b/src/laserMapping.cpp
+@@ -86,6 +86,9 @@ condition_variable sig_buffer;
+ 
+ string root_dir = ROOT_DIR;
+ string map_file_path, lid_topic, imu_topic;
++string odom_topic = "/Odometry";
++string odom_frame = "camera_init";
++string base_frame = "body";
+ 
+ double res_mean_last = 0.05, total_residual = 0.0;
+ double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
+@@ -505,7 +508,7 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
+         pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
+         // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
+         laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
+-        laserCloudmsg.header.frame_id = "camera_init";
++        laserCloudmsg.header.frame_id = odom_frame;
+         pubLaserCloudFull->publish(laserCloudmsg);
+         publish_count -= PUBFRAME_PERIOD;
+     }
+@@ -557,7 +560,7 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
+     sensor_msgs::msg::PointCloud2 laserCloudmsg;
+     pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
+     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
+-    laserCloudmsg.header.frame_id = "body";
++    laserCloudmsg.header.frame_id = base_frame;
+     pubLaserCloudFull_body->publish(laserCloudmsg);
+     publish_count -= PUBFRAME_PERIOD;
+ }
+@@ -574,7 +577,7 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
+     sensor_msgs::msg::PointCloud2 laserCloudFullRes3;
+     pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
+     laserCloudFullRes3.header.stamp = get_ros_time(lidar_end_time);
+-    laserCloudFullRes3.header.frame_id = "camera_init";
++    laserCloudFullRes3.header.frame_id = odom_frame;
+     pubLaserCloudEffect->publish(laserCloudFullRes3);
+ }
+ 
+@@ -596,7 +599,7 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
+     pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
+     // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
+     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
+-    laserCloudmsg.header.frame_id = "camera_init";
++    laserCloudmsg.header.frame_id = odom_frame;
+     pubLaserCloudMap->publish(laserCloudmsg);
+ 
+     // sensor_msgs::msg::PointCloud2 laserCloudMap;
+@@ -627,8 +630,8 @@ void set_posestamp(T & out)
+ 
+ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
+ {
+-    odomAftMapped.header.frame_id = "camera_init";
+-    odomAftMapped.child_frame_id = "body";
++    odomAftMapped.header.frame_id = odom_frame;
++    odomAftMapped.child_frame_id = base_frame;
+     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
+     set_posestamp(odomAftMapped.pose);
+     pubOdomAftMapped->publish(odomAftMapped);
+@@ -645,9 +648,9 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
+     }
+ 
+     geometry_msgs::msg::TransformStamped trans;
+-    trans.header.frame_id = "camera_init";
++    trans.header.frame_id = odom_frame;
+     trans.header.stamp = odomAftMapped.header.stamp;
+-    trans.child_frame_id = "body";
++    trans.child_frame_id = base_frame;
+     trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
+     trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
+     trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
+@@ -662,7 +665,7 @@ void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
+ {
+     set_posestamp(msg_body_pose);
+     msg_body_pose.header.stamp = get_ros_time(lidar_end_time); // ros::Time().fromSec(lidar_end_time);
+-    msg_body_pose.header.frame_id = "camera_init";
++    msg_body_pose.header.frame_id = odom_frame;
+ 
+     /*** if path is too large, the rvis will crash ***/
+     static int jjj = 0;
+@@ -804,6 +807,9 @@ public:
+         this->declare_parameter<bool>("publish.scan_publish_en", true);
+         this->declare_parameter<bool>("publish.dense_publish_en", true);
+         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
++        this->declare_parameter<string>("publish.odom_topic", "/Odometry");
++        this->declare_parameter<string>("publish.odom_frame", "camera_init");
++        this->declare_parameter<string>("publish.base_frame", "body");
+         this->declare_parameter<int>("max_iteration", 4);
+         this->declare_parameter<string>("map_file_path", "");
+         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
+@@ -840,6 +846,9 @@ public:
+         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
+         this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
+         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
++        this->get_parameter_or<string>("publish.odom_topic", odom_topic, "/Odometry");
++        this->get_parameter_or<string>("publish.odom_frame", odom_frame, "camera_init");
++        this->get_parameter_or<string>("publish.base_frame", base_frame, "body");
+         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
+         this->get_parameter_or<string>("map_file_path", map_file_path, "");
+         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
+@@ -873,7 +882,7 @@ public:
+         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
+ 
+         path.header.stamp = this->get_clock()->now();
+-        path.header.frame_id ="camera_init";
++        path.header.frame_id = odom_frame;
+ 
+         // /*** variables definition ***/
+         // int effect_feat_num = 0, frame_num = 0;
+@@ -931,7 +940,7 @@ public:
+         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
+         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
+         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
+-        pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
++        pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic, 20);
+         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
+         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+ 
+diff --git a/src/preprocess.cpp b/src/preprocess.cpp
+index 88444f4..0f9cf40 100644
+--- a/src/preprocess.cpp
++++ b/src/preprocess.cpp
+@@ -549,9 +549,21 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
+     yaw_last[layer] = yaw_angle;
+     time_last[layer] = added_pt.curvature;
+ 
+-    if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
++    // 抽稀：与 velodyne_handler 完全一致的写法 —— 上面所有 yaw/时间状态
++    // 对【每个点】照常更新，只在入队前按 point_filter_num 取模过滤，
++    // 因此用 yaw 合成的点时间（curvature）完全不受影响。
++    //
++    // mid360_handler 原本漏了这一步：配置里 point_filter_num=3，而
++    // avia_handler / oust64_handler / velodyne_handler 三个都实现了，
++    // 只有这里没有 → 每帧硬吃约 15280 个点（19968 扣除 blind 内的），
++    // 单帧耗时约 100ms ≈ 输入间隔，于是启动阶段形成的约 13 帧积压
++    // 永远排不掉 → odom 时间戳比现在旧约 1.4s，闭环反馈延迟过大。
++    if (i % point_filter_num == 0)
+     {
+-      pl_surf.push_back(std::move(added_pt));
++      if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
++      {
++        pl_surf.push_back(std::move(added_pt));
++      }
+     }
+   }
+ }

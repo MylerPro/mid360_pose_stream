@@ -1,0 +1,72 @@
+/**:
+  ros__parameters:
+    feature_extract_enable: false
+    point_filter_num: 3
+    # 2026-10-13 调参：为降低位姿滞后（原 1413 ms，闭环反馈延迟过大）。
+    # 实测瓶颈在【体素滤波后的点数】(feats_down_size ~1766) × max_iteration 次
+    # ikd-Tree 5 近邻搜索，而不在原始点数（给 mid360_handler 加 point_filter_num
+    # 抽稀 15280->5093 后滞后毫无变化，已证伪）。
+    # 备份/回退见 backup_fastlio_20261013_lag_tuning/ 与
+    # patches/fastlio_lag_tuning.patch
+    max_iteration: 2
+    filter_size_surf: 1.0
+    filter_size_map: 0.5
+    cube_side_length: 1000.0
+    runtime_pos_log_enable: false
+    map_file_path: ""
+
+    common:
+      lid_topic: "/livox/lidar"
+      imu_topic: "/imu/data"
+      time_sync_en: false
+      time_offset_lidar_to_imu: 0.0
+
+    preprocess:
+      # MID360 PointCloud2 path.  The Livox driver is configured with
+      # xfer_format=0, which includes x/y/z/intensity and per-point time.
+      lidar_type: 4
+      scan_line: 4
+      blind: 0.5
+      timestamp_unit: 3
+      # scan_rate 必须等于雷达的实际帧率：mid360_handler 用
+      # omega_l = 0.361 * SCAN_RATE 从 yaw 合成每个点的时间。
+      # 若与驱动 publish_freq 不一致，合成时间会被拉伸/压缩
+      # （10 vs 60 会错 6 倍）→ 去畸变时间基准错 → 位姿退化甚至发散。
+      # 主 launch 会用 frame_rate 参数覆盖这里；单独起 FAST-LIO 调试时靠这个值。
+      scan_rate: 60
+
+    mapping:
+      acc_cov: 0.1
+      gyr_cov: 0.1
+      b_acc_cov: 0.0001
+      b_gyr_cov: 0.0001
+      fov_degree: 360.0
+      det_range: 100.0
+      extrinsic_est_en: true
+      extrinsic_T: [-0.011, -0.02329, 0.04412]
+      extrinsic_R: [1.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 1.0]
+
+    publish:
+      path_en: true
+      effect_map_en: false
+      map_en: false
+      scan_publish_en: true
+      dense_publish_en: false
+      scan_bodyframe_pub_en: true
+      odom_topic: "/odom"
+      odom_frame: "odom"
+      # FAST-LIO's state, and therefore the pose it publishes, is the MID360's
+      # internal IMU pose, so the odometry child frame is named after the sensor.
+      # livox_frame is the URDF ROOT link (see urdf/diffbot_mid360_hardware.urdf):
+      # it is also the frame the driver stamps /livox/lidar with, and
+      # base_link / base_footprint hang below it through the measured mount
+      # transform.  That keeps base_footprint an honest ground-projected robot
+      # frame for AMCL and RViz.  Do NOT point this at a frame that already has a
+      # URDF parent, or that frame would end up with two parents.
+      base_frame: "livox_frame"
+
+    pcd_save:
+      pcd_save_en: false
+      interval: -1

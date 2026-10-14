@@ -1,0 +1,144 @@
+<?xml version="1.0"?>
+<robot name="diffbot_mid360">
+  <material name="body_blue"><color rgba="0.08 0.30 0.48 1"/></material>
+  <material name="dark"><color rgba="0.05 0.06 0.07 1"/></material>
+  <material name="metal"><color rgba="0.65 0.68 0.70 1"/></material>
+
+  <!-- livox_frame is the URDF ROOT.  FAST-LIO publishes odom -> livox_frame
+       (publish.base_frame in config/mid360_fastlio_nav2.yaml) because its state
+       is the MID360's internal IMU pose, and the driver stamps /livox/lidar with
+       frame_id "livox_frame".  Every robot frame therefore hangs below the
+       sensor through the measured mount transform, which keeps base_footprint an
+       honest ground-projected body frame instead of silently aliasing the
+       sensor pose. -->
+  <link name="livox_frame">
+    <!-- No <inertial> here on purpose: KDL, which robot_state_publisher uses,
+         does not support a root link that carries inertia and logs a warning
+         about it.  This URDF is used for TF and display only (it has no Gazebo
+         plugins), so the 0.265 kg sensor mass is not needed. -->
+    <visual>
+      <!-- The frame is at the MID360 measurement origin; the housing extends 35 mm below it. -->
+      <origin xyz="0 0 -0.035"/>
+      <geometry><cylinder radius="0.035" length="0.07"/></geometry>
+      <material name="dark"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.035"/>
+      <geometry><cylinder radius="0.035" length="0.07"/></geometry>
+    </collision>
+  </link>
+
+  <link name="base_link">
+    <inertial>
+      <origin xyz="0 0 0"/>
+      <mass value="18.0"/>
+      <inertia ixx="0.2025" ixy="0" ixz="0" iyy="0.2775" iyz="0" izz="0.3375"/>
+    </inertial>
+    <visual>
+      <geometry><box size="0.80 0.87 0.18"/></geometry>
+      <material name="body_blue"/>
+    </visual>
+    <collision>
+      <geometry><box size="0.80 0.87 0.18"/></geometry>
+    </collision>
+  </link>
+  <joint name="livox_to_base_link_joint" type="fixed">
+    <parent link="livox_frame"/>
+    <child link="base_link"/>
+    <!-- x forward.  The MID360 sits on the FRONT crossbeam: its measurement
+         origin is 0.721 m above ground, so the body centre is 0.581 m below and
+         0.40 m behind it, i.e. 0.14 m above ground. -->
+    <origin xyz="-0.40 0 -0.581"/>
+  </joint>
+
+  <link name="base_footprint"/>
+  <joint name="base_footprint_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="base_footprint"/>
+    <!-- Ground projection of the body centre: the honest base_footprint that
+         AMCL (base_frame_id) and RViz expect. -->
+    <origin xyz="0 0 -0.14"/>
+  </joint>
+
+  <link name="left_wheel_link">
+    <inertial>
+      <mass value="1.2"/>
+      <inertia ixx="0.00355" ixy="0" ixz="0" iyy="0.006" iyz="0" izz="0.00355"/>
+    </inertial>
+    <visual>
+      <origin rpy="1.570796 0 0"/>
+      <geometry><cylinder radius="0.10" length="0.045"/></geometry>
+      <material name="dark"/>
+    </visual>
+    <collision>
+      <origin rpy="1.570796 0 0"/>
+      <geometry><cylinder radius="0.10" length="0.045"/></geometry>
+      <surface><friction><ode><mu>1.2</mu><mu2>1.2</mu2></ode></friction></surface>
+    </collision>
+  </link>
+  <joint name="left_wheel_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="left_wheel_link"/>
+    <origin xyz="0 0.1725 -0.04"/>
+    <axis xyz="0 1 0"/>
+    <dynamics damping="0.1" friction="0.0"/>
+  </joint>
+
+  <link name="right_wheel_link">
+    <inertial>
+      <mass value="1.2"/>
+      <inertia ixx="0.00355" ixy="0" ixz="0" iyy="0.006" iyz="0" izz="0.00355"/>
+    </inertial>
+    <visual>
+      <origin rpy="1.570796 0 0"/>
+      <geometry><cylinder radius="0.10" length="0.045"/></geometry>
+      <material name="dark"/>
+    </visual>
+    <collision>
+      <origin rpy="1.570796 0 0"/>
+      <geometry><cylinder radius="0.10" length="0.045"/></geometry>
+      <surface><friction><ode><mu>1.2</mu><mu2>1.2</mu2></ode></friction></surface>
+    </collision>
+  </link>
+  <joint name="right_wheel_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="right_wheel_link"/>
+    <origin xyz="0 -0.1725 -0.04"/>
+    <axis xyz="0 1 0"/>
+    <dynamics damping="0.1" friction="0.0"/>
+  </joint>
+
+  <link name="front_caster_link">
+    <inertial><mass value="0.2"/><inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/></inertial>
+    <visual><geometry><sphere radius="0.035"/></geometry><material name="metal"/></visual>
+    <collision><geometry><sphere radius="0.035"/></geometry></collision>
+  </link>
+  <joint name="front_caster_joint" type="fixed">
+    <parent link="base_link"/><child link="front_caster_link"/>
+    <origin xyz="0.155 0 -0.105"/>
+  </joint>
+
+  <link name="rear_caster_link">
+    <inertial><mass value="0.2"/><inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/></inertial>
+    <visual><geometry><sphere radius="0.035"/></geometry><material name="metal"/></visual>
+    <collision><geometry><sphere radius="0.035"/></geometry></collision>
+  </link>
+  <joint name="rear_caster_joint" type="fixed">
+    <parent link="base_link"/><child link="rear_caster_link"/>
+    <origin xyz="-0.155 0 -0.105"/>
+  </joint>
+
+  <link name="imu_link">
+    <inertial><mass value="0.05"/><inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/></inertial>
+  </link>
+  <joint name="imu_joint" type="fixed">
+    <parent link="livox_frame"/><child link="imu_link"/>
+    <!-- The MID360's internal IMU.  FAST-LIO's factory extrinsic_T
+         [-0.011, -0.02329, 0.04412] is the LiDAR pose expressed in the IMU body
+         frame, so the IMU sits 44.12 mm below the measurement origin
+         (0.677 m above ground) - not at the body centre as an earlier revision
+         of this file claimed. -->
+    <origin xyz="0.011 0.02329 -0.04412"/>
+  </joint>
+
+</robot>
