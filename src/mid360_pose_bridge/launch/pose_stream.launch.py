@@ -83,6 +83,8 @@ def generate_launch_description():
     log_frames = LaunchConfiguration("log_frames")
     max_speed = LaunchConfiguration("max_speed")
     divergence_frames = LaunchConfiguration("divergence_frames")
+    max_lidar_gap = LaunchConfiguration("max_lidar_gap")
+    lidar_relock_gap = LaunchConfiguration("lidar_relock_gap")
     max_lidar_backlog = LaunchConfiguration("max_lidar_backlog")
     rviz = LaunchConfiguration("rviz")
 
@@ -169,6 +171,9 @@ def generate_launch_description():
             # 发散看门狗：位姿源发散时【停发】，避免底盘收到乱跑的位姿
             "max_speed": ParameterValue(max_speed, value_type=float),
             "divergence_frames": ParameterValue(divergence_frames, value_type=int),
+            # 雷达断流看门狗：超时停发（雷达一断，位姿就退化成纯 IMU 推算）
+            "max_lidar_gap": ParameterValue(max_lidar_gap, value_type=float),
+            "lidar_relock_gap": ParameterValue(lidar_relock_gap, value_type=float),
             "stats_period": 5.0,
             "reconnect_period": 2.0,
         }],
@@ -220,6 +225,16 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "divergence_frames", default_value="5",
             description="连续多少帧超速后锁死停发。60Hz 下 5 帧仅 83 ms。"),
+        DeclareLaunchArgument(
+            "max_lidar_gap", default_value="1.0",
+            description="雷达断流看门狗：超过这个秒数没收到 /livox/lidar 就停发。"
+                        "雷达一断，FAST-LIO 退化成纯 IMU 推算，位姿会漂但时间戳"
+                        "依然新鲜（max_pose_age 抓不到）。设 0 关闭。"),
+        DeclareLaunchArgument(
+            "lidar_relock_gap", default_value="5.0",
+            description="雷达断流超过这个秒数就【锁死】，必须调 refresh_origin 才恢复。"
+                        "车体调试断电会让雷达掉电，此时底盘也忘了零点，两边都不可信，"
+                        "必须重新建立零点。短于此值的小抖动会自动恢复。"),
         DeclareLaunchArgument(
             "max_lidar_backlog", default_value="5",
             description="FAST-LIO 最多保留几帧雷达数据（治那 1.4 秒启动积压）。"

@@ -147,7 +147,9 @@ def main():
          "-p", "map_frame:=odom", "-p", "base_frame:=base_link",
          "-p", f"send_rate:={SEND_RATE}", "-p", "auto_origin:=true",
          "-p", "log_frames:=false", "-p", "stats_period:=0.0",
-         "-p", "max_pose_age:=5.0", "-r", "__node:=serial_pose_bridge"],
+         "-p", "max_pose_age:=5.0",
+        # 离线测试没有雷达，关掉雷达断流看门狗（它由 offline_lidar_outage_test 单独测）
+        "-p", "max_lidar_gap:=0.0", "-r", "__node:=serial_pose_bridge"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
     emit(f"脚本轨迹: 静止→直线 {LINEAR} m→静止→转 {math.degrees(TURN):.1f}°→静止")

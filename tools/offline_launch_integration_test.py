@@ -110,6 +110,8 @@ def main():
         "frame_rate:=60", f"send_rate:={SEND_RATE}",
         f"serial_port:={slave_name}", "rviz:=false",
         "max_tf_age:=5.0",
+        # 离线没有雷达，关掉雷达断流看门狗（由 offline_lidar_outage_test 单独测）
+        "max_lidar_gap:=0",
     ]
     logf = open(LOG, "wb")
     emit("启动 launch ...")
